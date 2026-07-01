@@ -76,6 +76,7 @@ Before diving in, match the task to the right workflow — this avoids wasted ef
 | Your task | What to do |
 |-----------|-----------|
 | **"spec", "design with", "collaborative spec"** | Use `/amq-spec` instead — it has structured phase-by-phase guidance for parallel-research workflows. |
+| **"talk to/discuss with/consult with Claude"** | Resolve the current AMQ session first with `amq env --json`, inspect that exact session in `amq who --json`, and use its active Claude if present. If Claude is not active in the current session, do **not** offer unrelated active Claude sessions as choices; use the standard handoff fallback unless the user explicitly names another session. |
 | **Send a message, review request, question** | Use `amq send` (see Messaging below) |
 | **Swarm / agent teams** | Read [references/swarm-mode.md](references/swarm-mode.md), then use `amq swarm` |
 | **Received message with labels `workflow:spec`** | Follow the spec skill protocol: do independent research first, then engage on the `spec/<topic>` thread — don't skip straight to implementation. |
@@ -260,6 +261,15 @@ amq send --to codex --project infra-lib --kind decision \
 Users refer to sessions using many words: "session", "stream", "squad", "team", "workspace", "channel", or just a bare name. When the user mentions sending to or talking to an agent in a named context (e.g., "ask codex on stream1", "send to the auth team", "talk to codex in squad-api"), you must discover sessions before routing.
 
 **Important**: Do not confuse sessions with projects. "Project" in AMQ means a different repo/codebase (cross-project routing via `--project`). Sessions are isolated mailbox trees within the same project (via `--session`). If the user says "the infra project", that likely means `--project infra`, not `--session infra`.
+
+### Current-session first for peer discussions
+When the user asks to talk to, discuss with, consult with, or ask Claude without naming a different session, the current AMQ session is the intended peer context.
+
+1. Run `amq env --json` and note `session_name`, `root`, and `me`.
+2. Run `amq who --json` and inspect the entry whose `name` equals that `session_name`.
+3. If that entry has `claude` active, send to Claude in the current session.
+4. If that entry has `claude` present but inactive, or absent, use the standard handoff fallback. Do not ask the user to choose from unrelated globally active Claude sessions.
+5. Ask the user to choose a session only when they explicitly requested another session/context or named an ambiguous target.
 
 ```bash
 # Step 1: Discover active sessions and agents
