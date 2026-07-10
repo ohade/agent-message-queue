@@ -12,6 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Darwin wake identity now uses the stable `kern.bootsessionuuid` instead of
   the wall-clock-derived `kern.boottime`, while retaining a bounded legacy
   compatibility path and a safe `kern.boottime` fallback for older macOS.
+  Darwin process inspection also treats unreaped `SZOMB` wake processes as
+  stopped, so their stale wake locks can be replaced.
 - Accept-existing wake startup now verifies that an existing wake's injection
   mode and, for external wakes, persisted injector path and ordered arguments
   match the requested target; mismatched, owner-orphaned, or concurrently
