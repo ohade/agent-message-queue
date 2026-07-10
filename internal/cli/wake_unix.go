@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -22,6 +23,10 @@ import (
 	"github.com/fsnotify/fsnotify"
 	"golang.org/x/sys/unix"
 )
+
+const maxWakeLockAcquireInspections = 8
+
+var errWakeLockChangedDuringReplacement = errors.New("wake lock changed during orphan replacement")
 
 var (
 	signalWakeProcess = func(pid int, sig os.Signal) error {
@@ -71,7 +76,15 @@ func acquireWakeLockWithOptions(root, me string, options wakeLockAcquireOptions)
 		return nil, fmt.Errorf("failed to create agent directory: %w", err)
 	}
 
-	// Check existing lock
+	inspectionCount := 0
+
+retryInspection:
+	if inspectionCount >= maxWakeLockAcquireInspections {
+		return nil, fmt.Errorf("wake lock changed repeatedly while acquiring for %s; retry", me)
+	}
+	inspectionCount++
+
+	// Check existing lock.
 	inspection := inspectWakeLock(root, me)
 	if inspection.Exists {
 		switch inspection.Status {
@@ -86,13 +99,26 @@ func acquireWakeLockWithOptions(root, me string, options wakeLockAcquireOptions)
 			return nil, fmt.Errorf("wake lock is being created (retry shortly)")
 		case wakeLockValid:
 			if options.acceptExistingValid {
-				if err := requireWakeLockUsable(inspection); err != nil {
+				replace, replaceErr := shouldReplaceOwnerOrphanedWakeLock(inspection)
+				if replaceErr != nil {
+					if errors.Is(replaceErr, errWakeLockChangedDuringReplacement) {
+						goto retryInspection
+					}
+					return nil, replaceErr
+				}
+				if replace {
+					goto createLock
+				}
+				if err := requireWakeLockUsable(inspection, options.target); err != nil {
 					return nil, err
 				}
 				return nil, wakeLockAlreadyRunningError(me, inspection)
 			}
 			replace, replaceErr := shouldReplaceOrphanedWakeLock(inspection)
 			if replaceErr != nil {
+				if errors.Is(replaceErr, errWakeLockChangedDuringReplacement) {
+					goto retryInspection
+				}
 				return nil, replaceErr
 			}
 			if replace {
@@ -144,9 +170,20 @@ createLock:
 			winner := inspectWakeLock(root, me)
 			if winner.Status == wakeLockValid {
 				if options.acceptExistingValid {
-					if usableErr := requireWakeLockUsable(winner); usableErr != nil {
+					replace, replaceErr := shouldReplaceOwnerOrphanedWakeLock(winner)
+					if replaceErr != nil {
+						if errors.Is(replaceErr, errWakeLockChangedDuringReplacement) {
+							goto retryInspection
+						}
+						return nil, replaceErr
+					}
+					if replace {
+						goto createLock
+					}
+					if usableErr := requireWakeLockUsable(winner, options.target); usableErr != nil {
 						return nil, usableErr
 					}
+					return nil, wakeLockAlreadyRunningError(me, winner)
 				}
 				return nil, wakeLockAlreadyRunningError(me, winner)
 			}
@@ -179,11 +216,16 @@ createLock:
 }
 
 func shouldReplaceOrphanedWakeLock(inspection wakeLockInspection) (bool, error) {
-	if !wakeLockNeedsReplacement(inspection) {
-		replace, err := wakeLockNeedsOwnerReplacement(inspection)
-		if err != nil || !replace {
-			return replace, err
-		}
+	if wakeLockNeedsReplacement(inspection) {
+		return replaceConfirmedOrphanedWakeLock(inspection)
+	}
+	return shouldReplaceOwnerOrphanedWakeLock(inspection)
+}
+
+func shouldReplaceOwnerOrphanedWakeLock(inspection wakeLockInspection) (bool, error) {
+	replace, err := wakeLockNeedsOwnerReplacement(inspection)
+	if err != nil || !replace {
+		return replace, err
 	}
 	return replaceConfirmedOrphanedWakeLock(inspection)
 }
@@ -236,7 +278,7 @@ func wakeLockNeedsOwnerReplacement(inspection wakeLockInspection) (bool, error) 
 	return wakeOwnerHealthCheck(*target.Owner) != nil, nil
 }
 
-func requireWakeLockUsable(inspection wakeLockInspection) error {
+func requireWakeLockUsable(inspection wakeLockInspection, requestedTarget *wakeTarget) error {
 	if !inspection.Exists || inspection.Status != wakeLockValid || !inspection.IdentityConfirmed {
 		return fmt.Errorf("existing wake lock for %s is not a confirmed valid wake", inspection.Agent)
 	}
@@ -248,15 +290,59 @@ func requireWakeLockUsable(inspection wakeLockInspection) error {
 		return fmt.Errorf("existing wake lock for %s is not usable for --require-wake (pid %d on %s since %s)",
 			inspection.Agent, inspection.Lock.PID, inspection.Lock.TTY, inspection.Lock.Started)
 	}
+	external := wakeLockUsesExternalInjector(inspection)
+	if requestedTarget == nil {
+		if external {
+			return fmt.Errorf("existing wake for %s uses inject-via and does not match the requested raw terminal target", inspection.Agent)
+		}
+	} else {
+		if !external {
+			return fmt.Errorf("existing wake for %s uses raw terminal injection and does not match the requested inject-via target", inspection.Agent)
+		}
+		if err := requireExistingWakeTargetMatches(inspection, *requestedTarget); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
 func wakeLockHasTTYOrExternalInjector(inspection wakeLockInspection) bool {
-	if inspection.Lock.WakeMode == wakeTargetInjectVia || wakeArgsUseInjectVia(inspection.Process.Args) {
+	if wakeLockUsesExternalInjector(inspection) {
 		return true
 	}
 	tty := strings.TrimSpace(inspection.Lock.TTY)
 	return tty != "" && tty != "unknown"
+}
+
+func wakeLockUsesExternalInjector(inspection wakeLockInspection) bool {
+	return inspection.Lock.WakeMode == wakeTargetInjectVia || wakeArgsUseInjectVia(inspection.Process.Args)
+}
+
+func requireExistingWakeTargetMatches(inspection wakeLockInspection, requested wakeTarget) error {
+	existing, exists, err := readWakeTarget(inspection.Root, inspection.Agent)
+	if err != nil {
+		return fmt.Errorf("existing inject-via wake target cannot be verified: %w", err)
+	}
+	if !exists {
+		return fmt.Errorf("existing inject-via wake target cannot be verified: wake target is missing")
+	}
+	if err := validateWakeTarget(existing, inspection.Root, inspection.Agent); err != nil {
+		return fmt.Errorf("existing inject-via wake target cannot be verified: %w", err)
+	}
+	if err := validateWakeTargetMatchesLock(inspection.Lock, existing); err != nil {
+		return fmt.Errorf("existing inject-via wake target cannot be verified: %w", err)
+	}
+	if err := validateWakeTarget(requested, inspection.Root, inspection.Agent); err != nil {
+		return fmt.Errorf("requested inject-via wake target is invalid: %w", err)
+	}
+	if existing.Mode != requested.Mode ||
+		canonicalWakeRoot(existing.Root) != canonicalWakeRoot(requested.Root) ||
+		existing.Agent != requested.Agent ||
+		existing.InjectVia != requested.InjectVia ||
+		!slices.Equal(existing.InjectArgs, requested.InjectArgs) {
+		return fmt.Errorf("existing inject-via wake target does not match requested --wake-inject-via/--wake-inject-arg values")
+	}
+	return nil
 }
 
 func wakeArgsUseInjectVia(args []string) bool {
@@ -275,7 +361,7 @@ func replaceConfirmedOrphanedWakeLock(inspection wakeLockInspection) (bool, erro
 func terminateAndRemoveOrphanedWakeLock(inspection wakeLockInspection) (bool, error) {
 	recheck := inspectWakeLock(inspection.Root, inspection.Agent)
 	if !sameWakeLockInspection(inspection, recheck) || !recheck.IdentityConfirmed {
-		return false, nil
+		return false, errWakeLockChangedDuringReplacement
 	}
 	if err := terminateWakeProcess(recheck); err != nil {
 		return false, err
@@ -1038,7 +1124,7 @@ func wakeOwnerHealthCheck(owner wakeOwner) error {
 			return fmt.Errorf("inject-via wake owner process start changed for pid %d", owner.PID)
 		}
 	}
-	if owner.BootID != "" && proc.BootID != "" && proc.BootID != owner.BootID {
+	if wakeBootIDMismatch(owner.BootID, proc) {
 		return fmt.Errorf("inject-via wake owner boot id changed for pid %d", owner.PID)
 	}
 	if owner.SessionID != 0 {
