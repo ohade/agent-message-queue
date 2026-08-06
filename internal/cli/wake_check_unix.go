@@ -62,10 +62,11 @@ type wakeCheckMetadataFingerprint struct {
 }
 
 type wakeCheckObservation struct {
-	Inspection wakeLockInspection
-	Target     wakeCheckMetadataFingerprint
-	Floor      wakeCheckMetadataFingerprint
-	Repair     wakeRepairAssessment
+	Inspection       wakeLockInspection
+	Target           wakeCheckMetadataFingerprint
+	Floor            wakeCheckMetadataFingerprint
+	Repair           wakeRepairAssessment
+	OwnerBoundOrphan bool
 }
 
 type wakeCheckSnapshot struct {
@@ -141,8 +142,10 @@ func inspectWakeCheckSnapshot(root, me string) wakeCheckSnapshot {
 	}
 	opsLock := opsWakeLockFromWakeCheckObservation(root, me, second)
 	snapshot := wakeCheckSnapshot{
-		OpsLock:  opsLock,
-		Decision: buildWakeCheckDecision(root, me, second.Inspection, opsLock, true),
+		OpsLock: opsLock,
+		Decision: buildWakeCheckDecision(
+			root, me, second.Inspection, opsLock, second.OwnerBoundOrphan, true,
+		),
 	}
 	// Image probing occurs while building the decision. Re-observe afterwards
 	// so a PID reuse or lock generation change cannot inherit that conclusion.
@@ -181,7 +184,9 @@ func observeWakeCheck(root, me string) (wakeCheckObservation, error) {
 				selection, err := readWakeStateSelectionForInspectionAt(
 					dirfd, agentDir, root, me, observation.Inspection,
 				)
-				fingerprintErr := recordWakeCheckSelectionTarget(&observation, selection)
+				fingerprintErr := recordWakeCheckSelectionTarget(
+					&observation, selection, root, me,
+				)
 				if fingerprintErr != nil {
 					return selection.Target, selection.TargetPresent, fingerprintErr
 				}
@@ -235,7 +240,12 @@ func observeWakeCheck(root, me string) (wakeCheckObservation, error) {
 	return observation, nil
 }
 
-func recordWakeCheckSelectionTarget(observation *wakeCheckObservation, selection wakeStateReadSelection) error {
+func recordWakeCheckSelectionTarget(
+	observation *wakeCheckObservation,
+	selection wakeStateReadSelection,
+	root string,
+	me string,
+) error {
 	observation.Target.Exists = selection.TargetPresent
 	if !selection.TargetPresent {
 		return nil
@@ -251,6 +261,11 @@ func recordWakeCheckSelectionTarget(observation *wakeCheckObservation, selection
 		return err
 	}
 	observation.Target = fingerprint
+	if !observation.Inspection.Exists &&
+		selection.legacy.TargetPresent &&
+		validateAuthoritativeWakeTarget(selection.legacy.Target.Target, root, me) == nil {
+		observation.OwnerBoundOrphan = true
+	}
 	return nil
 }
 
@@ -276,7 +291,8 @@ func sameWakeCheckObservation(first, second wakeCheckObservation) bool {
 	return sameWakeCheckInspection(first.Inspection, second.Inspection) &&
 		first.Target == second.Target &&
 		first.Floor == second.Floor &&
-		first.Repair == second.Repair
+		first.Repair == second.Repair &&
+		first.OwnerBoundOrphan == second.OwnerBoundOrphan
 }
 
 func opsWakeLockFromWakeCheckObservation(
@@ -321,7 +337,7 @@ func opsWakeLockFromWakeCheckObservation(
 func unstableWakeCheckDecision(root, me string, inspection wakeLockInspection) wakeCheckDecision {
 	// Unstable state cannot authorize an image conclusion, and probing again
 	// would widen the observation window after instability is already known.
-	decision := buildWakeCheckDecision(root, me, inspection, nil, false)
+	decision := buildWakeCheckDecision(root, me, inspection, nil, false, false)
 	detail := "wake state changed during inspection"
 	reason := wakeRepairReasonExactEvidenceMissing
 	decision.Repair.InjectViaAvailable = false
@@ -401,6 +417,7 @@ func buildWakeCheckDecision(
 	root, me string,
 	inspection wakeLockInspection,
 	opsLock *opsWakeLock,
+	ownerBoundOrphan bool,
 	probeImage bool,
 ) wakeCheckDecision {
 	// probeImage is intentionally enabled only for the single-target wake
@@ -409,7 +426,8 @@ func buildWakeCheckDecision(
 	// alone.
 	start := inspectWakeStartCapability(me)
 	startReason, startDetail := wakeCheckStartReason(start)
-	ownerBound := classifyWakeClaimForGenericTransition(inspection) == wakeClaimAuthoritative
+	ownerBound := ownerBoundOrphan ||
+		classifyWakeClaimForGenericTransition(inspection) == wakeClaimAuthoritative
 	wakeStatus := string(inspection.Status)
 	if !inspection.Exists {
 		wakeStatus = string(wakeLockMissing)
@@ -621,7 +639,7 @@ func decorateOpsWakeLockWithWakeCheck(
 	default:
 		lock.ImageStatus = wakeImageUnknown
 	}
-	legacyDecision := buildWakeCheckDecision(root, agent, inspection, lock, false)
+	legacyDecision := buildWakeCheckDecision(root, agent, inspection, lock, false, false)
 	check := renderWakeCheckV1(legacyDecision)
 	lock.CanStartHere = check.CanStartHere
 	lock.StartMode = check.StartMode
@@ -668,6 +686,20 @@ func classifyWakeCheckRestart(
 	startArgv := wakeCheckActionCommand(
 		"wake", "--root", decision.Root, "--me", decision.Agent,
 	)
+	if !inspection.Exists && decision.Wake.OwnerBound {
+		message := wakeRecoverOwnerCommand(decision.Root, decision.Agent)
+		decision.RestartCapability = wakeRestartUnavailable
+		decision.Action = wakeCheckActionDecision{
+			Kind:       wakeActionRecoverOwner,
+			Actor:      wakeActionActorOperator,
+			ReasonCode: wakeReasonOwnerRecoveryRequired,
+			Command: wakeCheckActionCommand(
+				"wake", "recover-owner", "--root", decision.Root, "--me", decision.Agent,
+			),
+			Message: message,
+		}
+		return
+	}
 	if !inspection.Exists {
 		switch {
 		case decision.Start.Available && decision.Start.Mode != wakeInjectModeNone:

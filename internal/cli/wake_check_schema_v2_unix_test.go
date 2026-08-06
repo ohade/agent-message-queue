@@ -723,7 +723,7 @@ func TestWakeCheckV2ReloadClassificationIsStructuralAndNonExecutable(t *testing.
 	}
 
 	stubWakeCheckRuntime(t, false, "0.50.1")
-	decision := buildWakeCheckDecision("/queue", "codex", validInspection, &opsWakeLock{}, false)
+	decision := buildWakeCheckDecision("/queue", "codex", validInspection, &opsWakeLock{}, false, false)
 	if decision.Reload.Status != validStatus ||
 		decision.Reload.ReasonCode != validReason ||
 		decision.RestartCapability != wakeRestartOperatorOnly ||
@@ -757,7 +757,7 @@ func TestWakeCheckV2RejectsResumeAdvertisementBoundOnlyToArtifactAgent(t *testin
 				IdentityConfirmed: true,
 			}
 
-			decision := buildWakeCheckDecision(lock.Root, "codex", inspection, &opsWakeLock{}, false)
+			decision := buildWakeCheckDecision(lock.Root, "codex", inspection, &opsWakeLock{}, false, false)
 			if decision.Reload.Status != wakeReloadUnavailable ||
 				decision.Reload.ReasonCode != wakeReloadReasonAdvertisementInvalid {
 				t.Fatalf("artifact-bound reload decision = %#v, want invalid advertisement", decision.Reload)
@@ -1410,6 +1410,56 @@ func TestWakeCheckV2AdvertisedRepairRevalidatesChangedGeneration(t *testing.T) {
 		t.Fatal("repair unexpectedly accepted changed generation")
 	}
 	assertWakeCheckTreeUnchanged(t, root, before)
+}
+
+func TestWakeCheckV2ReportsOwnerBoundOrphanTargetRecovery(t *testing.T) {
+	root := secureTempDirForTest(t)
+	if err := fsq.EnsureAgentDirs(root, "codex"); err != nil {
+		t.Fatal(err)
+	}
+	target := mustNewWakeTargetForTest(
+		t,
+		root,
+		"codex",
+		writeExecutableForTest(t, "owner-orphan-check-injector"),
+		[]string{"exec"},
+	)
+	target.Owner = &wakeOwner{
+		PID:          4242,
+		ProcessStart: "12345",
+		BootID:       "11111111-1111-1111-1111-111111111111",
+		SessionID:    99,
+	}
+	if err := writeWakeTarget(root, "codex", target); err != nil {
+		t.Fatal(err)
+	}
+	wakeDir, err := openWakeAgentDir(root, "codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = wakeDir.Close() })
+	fixture := wakeStateUnixFixture{
+		root:     root,
+		agent:    "codex",
+		injector: target.InjectVia,
+		agentDir: wakeDir,
+	}
+	if _, err := publishWakeStateForTest(fixture, captureWakeStateLegacyForTest(t, fixture)); err != nil {
+		t.Fatalf("publish orphan target state: %v", err)
+	}
+	stubWakeCheckRuntime(t, false, "0.55.0")
+
+	decision := inspectWakeCheckDecision(root, "codex")
+	if decision.Wake.Status != string(wakeLockMissing) ||
+		decision.Wake.Live ||
+		!decision.Wake.OwnerBound {
+		t.Fatalf("owner-bearing orphan wake = %#v", decision.Wake)
+	}
+	if decision.Action.Kind != wakeActionRecoverOwner ||
+		decision.Action.Actor != wakeActionActorOperator ||
+		decision.Action.Command == nil {
+		t.Fatalf("owner-bearing orphan action = %#v", decision.Action)
+	}
 }
 
 func requireJSONObject(t *testing.T, object map[string]any, key string) map[string]any {
