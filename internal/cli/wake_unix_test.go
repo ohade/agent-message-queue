@@ -6775,6 +6775,37 @@ func TestRequireWakeLockUsableModeMatrix(t *testing.T) {
 	}
 }
 
+func TestRequireWakeLockUsableReusesDetachedExactExternalInjector(t *testing.T) {
+	root := secureTempDirForTest(t)
+	injector := writeExecutableForTest(t, "detached-exact-injector")
+	target := mustNewWakeTargetForTest(t, root, "codex", injector, []string{"exec", "fixed"})
+	if err := writeWakeTarget(root, "codex", target); err != nil {
+		t.Fatalf("writeWakeTarget: %v", err)
+	}
+	inspection := wakeLockInspection{
+		Exists:            true,
+		Status:            wakeLockValid,
+		IdentityConfirmed: true,
+		Root:              canonicalWakeRoot(root),
+		Agent:             "codex",
+		Lock:              bindWakeLockToTarget(wakeLock{WakeMode: wakeTargetInjectVia}, target),
+		Process: wakeProcessInfo{
+			ControllingTerminalKnown: true,
+			HasControllingTerminal:   false,
+		},
+	}
+
+	if err := requireWakeLockUsable(inspection, wakeTargetInjectVia, &target); err != nil {
+		t.Fatalf("detached exact external injector was not reusable: %v", err)
+	}
+
+	different := mustNewWakeTargetForTest(t, root, "codex", injector, []string{"exec", "different"})
+	if err := requireWakeLockUsable(inspection, wakeTargetInjectVia, &different); err == nil ||
+		!strings.Contains(err.Error(), "different injector path or fixed arguments") {
+		t.Fatalf("different injector error = %v, want exact-target refusal", err)
+	}
+}
+
 func emptyAsLegacy(mode string) string {
 	if mode == "" {
 		return "legacy-empty"

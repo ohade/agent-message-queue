@@ -786,7 +786,8 @@ func wakeLockNeedsReplacement(inspection wakeLockInspection) bool {
 	// External injectors do not depend on a controlling terminal. Supervisors
 	// deliberately detach these wakes so they outlive short-lived launchers; a
 	// missing TTY is therefore healthy and exact-target readiness reuse must
-	// continue to the persisted-target identity checks below.
+	// continue. Readiness callers still verify the persisted target and injector
+	// identity after this replacement decision returns false.
 	if inspection.Lock.WakeMode == wakeTargetInjectVia ||
 		inspection.Lock.WakeMode == wakeOwnerWakeMode {
 		return false
