@@ -9441,6 +9441,36 @@ func TestWakeInjectionPreconditionCheckSurfacesPersistenceFailureAfterDemotion(t
 	}
 }
 
+func TestWakeLockNeedsReplacementPreservesDetachedExternalInjectors(t *testing.T) {
+	for _, mode := range []string{wakeTargetInjectVia, wakeOwnerWakeMode} {
+		t.Run(mode, func(t *testing.T) {
+			inspection := wakeLockInspection{
+				IdentityConfirmed: true,
+				Lock:              wakeLock{WakeMode: mode},
+				Process: wakeProcessInfo{
+					ControllingTerminalKnown: true,
+					HasControllingTerminal:   false,
+				},
+			}
+			if wakeLockNeedsReplacement(inspection) {
+				t.Fatalf("detached external injector mode %q requires replacement", mode)
+			}
+		})
+	}
+
+	raw := wakeLockInspection{
+		IdentityConfirmed: true,
+		Lock:              wakeLock{WakeMode: wakeInjectModeRaw},
+		Process: wakeProcessInfo{
+			ControllingTerminalKnown: true,
+			HasControllingTerminal:   false,
+		},
+	}
+	if !wakeLockNeedsReplacement(raw) {
+		t.Fatal("detached raw wake should still require replacement")
+	}
+}
+
 func testEnvValue(env []string, key string) string {
 	prefix := key + "="
 	for _, entry := range env {
